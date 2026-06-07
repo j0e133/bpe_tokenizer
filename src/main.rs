@@ -1,5 +1,5 @@
 
-use std::{collections::HashMap, fs::read_to_string, path::Path, time::Instant};
+use std::{collections::HashMap, fs::{read_to_string, write}, path::Path, time::Instant};
 
 use itertools::Itertools;
 
@@ -42,65 +42,63 @@ impl Rule {
             }
         }
     }
-
-    fn to_string(&self) -> String {
-        format!("[{}, {}, {}]", self.a.0, self.b.0, self.replacement.0)
-    }
 }
 
 
 pub struct BPETokenizer {
-    vocab: HashMap<char, Token>,
-    token_map: Vec<String>,
-    rules: Vec<Rule>
+    vocab: Vec<String>,
+    rules: Vec<Rule>,
+    encoding_table: HashMap<char, Token>
 }
 
 impl BPETokenizer {
-    pub fn new(vocab: HashMap<char, Token>, token_map: Vec<String>, rules: Vec<Rule>) -> Self {
+    pub fn new(vocab: Vec<String>, rules: Vec<Rule>, encoding_table: HashMap<char, Token>) -> Self {
         Self {
             vocab,
-            token_map,
-            rules
+            rules,
+            encoding_table
         }
     }
 
-    /// Creates a tokenizer from the text contained in a file with a given max vocab size. if `vocab_size` is 0, it will continue until no pairs remain (not recommended for large input strings).
-    pub fn from_file(filename: &String, vocab_size: usize) -> Self {
-        Self::from_text(&read_file(filename), vocab_size)
-    }
-
-    /// Creates a tokenizer from a String with a given max vocab size. if `vocab_size` is 0, it will continue until no pairs remain (not recommended for large input strings).
-    pub fn from_text(text: &String, vocab_size: usize) -> Self {
-        let vocab: HashMap<char, Token> = 
+    /// Creates a tokenizer from a String.
+    /// 
+    /// `vocab_size` is the maximum number of vocab chunks the tokenizer will create, unlimited if 0.
+    /// 
+    /// `min_frequency` is the lowest frequency in the text at which pairs will still be combined. Should be >= 2
+    pub fn from_text(text: &String, vocab_size: usize, min_frequency: usize, low_memory: bool) -> Self {
+        let mut vocab: Vec<String> =
             text.chars()
                 .unique()
                 .sorted()
-                .enumerate()
-                .map(|(i, ch)| (ch, Token(i)))
+                .map(|ch| ch.to_string())
                 .collect();
 
-        if 0 < vocab_size && vocab_size < vocab.len() { panic!("Parameter `vocab_size` (={}) is less than the text's vocab length of {}", vocab_size, vocab.len()) }
-
-        let mut token_map: Vec<String> =
+        let encoding_table: HashMap<char, Token> = 
             vocab.iter()
-                 .sorted_by_key(|&(_, tok)| tok.0)
-                 .map(|(ch, _)| ch.to_string())
+                 .enumerate()
+                 .map(|(i, ch)| (ch.chars().next().unwrap(), Token(i)))
                  .collect();
 
+        if 0 < vocab_size && vocab_size < encoding_table.len() { panic!("Parameter `vocab_size` (={}) is less than the text's vocab length of {}", vocab_size, encoding_table.len()) }
+
         let mut rules = Vec::with_capacity(vocab_size);
-        let mut token = token_map.len();
+        let mut token = vocab.len();
 
         let mut buffer: Vec<Token> = Vec::with_capacity(text.len());
         let mut encoding: Vec<Token> =
             text.chars()
-                .map(|ch| *vocab.get(&ch).unwrap())
+                .map(|ch| *encoding_table.get(&ch).unwrap())
                 .collect();
 
         while vocab_size == 0 || token < vocab_size {
-            let ((a, b), n) = Self::most_common_pair(&encoding, token);
+            let ((a, b), n) = if low_memory {
+                Self::most_common_pair_low_memory(&encoding, token)
+            } else {
+                Self::most_common_pair(&encoding, token)
+            };
 
-            // if combining only one pair done
-            if n < 2 { break }
+            // stop combining if frequency of pair < min_frequency
+            if n < min_frequency { break }
 
             let rule = Rule::new(a, b, Token(token));
             rule.apply_into(&encoding, &mut buffer);
@@ -109,14 +107,14 @@ impl BPETokenizer {
             std::mem::swap(&mut encoding, &mut buffer);
             buffer.clear();
 
-            let combined_str = format!("{}{}", token_map[a.0], token_map[b.0]);
+            let combined_str = format!("{}{}", vocab[a.0], vocab[b.0]);
 
-            token_map.push(combined_str);
+            vocab.push(combined_str);
             rules.push(rule);
             token += 1;
         }
 
-        Self::new(vocab, token_map, rules)
+        Self::new(vocab, rules, encoding_table)
     }
 
     /// Returns the most common common pair of consecutive tokens and how many times it appears.
@@ -133,7 +131,7 @@ impl BPETokenizer {
     }
 
     /// A slower but more memory efficient `most_common_pair` function.
-    fn _most_common_pair_low_memory(tokens: &Vec<Token>, _: usize) -> ((Token, Token), usize) {
+    fn most_common_pair_low_memory(tokens: &Vec<Token>, _: usize) -> ((Token, Token), usize) {
         let mut counts = HashMap::new();
 
         for i in 0..tokens.len() - 1 {
@@ -147,17 +145,12 @@ impl BPETokenizer {
         most_common
     }
 
-    /// Returns the number of tokens in the tokenizer's vocabulary.
-    pub fn num_tokens(&self) -> usize {
-        self.token_map.len()
-    }
-
     /// Encodes a String into a `Box<[Token]>`.
     pub fn encode(&self, text: &String) -> Box<[Token]> {
         let mut buffer: Vec<Token> = Vec::with_capacity(text.len());
         let mut encoding: Vec<Token> =
             text.chars()
-                .map(|ch| *self.vocab.get(&ch).expect("Character encountered in input string isn't in tokenizer vocab!"))
+                .map(|ch| *self.encoding_table.get(&ch).expect("Character encountered in input string isn't in tokenizer vocab!"))
                 .collect();
 
         for rule in &self.rules {
@@ -174,34 +167,118 @@ impl BPETokenizer {
     /// Decodes a `Box<[Token]>` into a String.
     pub fn decode(&self, tokenization: Box<[Token]>) -> String {
         tokenization.iter()
-                    .map(|token| &self.token_map[token.0])
+                    .map(|token| &self.vocab[token.0])
                     .join("")
+    }
+
+    fn to_json(&self) -> String {
+        let encoding_table =
+            self.encoding_table.iter()
+                               .map(|(ch, tok)| format!("\"{}\": {}", ch.escape_default().collect::<String>(), tok.0))
+                               .join(", ");
+
+        let vocab =
+            self.vocab.iter()
+                      .map(|voc| format!("\"{}\"", voc.escape_default().collect::<String>()))
+                      .join(", ");
+
+        let rules =
+            self.rules.iter()
+                      .map(|rule| format!("[{}, {}, {}]", rule.a.0, rule.b.0, rule.replacement.0))
+                      .join(", ");
+
+        format!("{{\"vocab\": [{}], \"rules\": [{}], \"encoding_table\": {{{}}}}}", vocab, rules, encoding_table)
+    }
+
+    fn save<T: AsRef<Path>>(&self, filename: T) -> std::io::Result<()> {
+        let json = self.to_json();
+
+        write(filename, json)?;
+
+        Ok(())
     }
 }
 
 
 
+fn error_exit(message: String) -> ! {
+    println!("\n{message}\n");
+
+    std::process::exit(0);
+}
+
+
+
 fn main() {
-    let text = read_file("texts/tiny-shakespeare.txt");
-
-    let start = Instant::now();
-    let tokenizer = BPETokenizer::from_text(&text, 1024);
-    println!("Time: {:?}", start.elapsed());
-
-    let start = Instant::now();
-    let encoded = tokenizer.encode(&text);
-    println!("Encoding time: {:?}", start.elapsed());
-
-    let start = Instant::now();
-    let decoded = tokenizer.decode(encoded.clone());
-    println!("Decoding time: {:?}", start.elapsed());
-
-    println!("Vocab ({}): {:?}", tokenizer.vocab.len(), tokenizer.vocab.keys().sorted().collect::<Vec<&char>>());
-    println!("Number of tokens: {}", tokenizer.num_tokens());
-    println!("Space use: {} -> {} -> {}", text.len(), encoded.len(), decoded.len());
-    println!();
-    println!("Encodings:");
-    for rule in tokenizer.rules.iter().take(25) {
-        println!("\"{}\" + \"{}\" -> \"{}\"", &tokenizer.token_map[rule.a.0].replace("\n", "\\n"), &tokenizer.token_map[rule.b.0].replace("\n", "\\n"), &tokenizer.token_map[rule.replacement.0].replace("\n", "\\n"))
+    enum Ident {
+        None,
+        File,
+        VocabSize,
+        MinFrequency,
+        LowMemory
     }
+
+    // parse command line arguments
+    let args: Vec<String> = std::env::args().skip(1).collect();
+
+    let mut ident = Ident::None;
+    let mut filename = None;
+    let mut vocab_size = 0;
+    let mut min_frequency = 2;
+    let mut low_memory = false;
+
+    for arg in args {
+        match ident {
+            Ident::None => {
+                ident = match arg.as_str() {
+                    "-f" | "--file"       => Ident::File,
+                    "-v" | "--vocab-size" => Ident::VocabSize,
+                    "--min-freq"          => Ident::MinFrequency,
+                    "--low-mem"           => Ident::LowMemory,
+                    other           => error_exit(format!("Invalid argument: {}", other))
+                }
+            }
+            Ident::File => {
+                filename = Some(arg);
+
+                ident = Ident::None;
+            }
+            Ident::VocabSize => {
+                vocab_size = str::parse::<usize>(arg.as_str()).unwrap_or_else(|_| error_exit(format!("Invalid value for --vocab-size: {}", arg)));
+
+                ident = Ident::None;
+            }
+            Ident::MinFrequency => {
+                min_frequency = str::parse::<usize>(arg.as_str()).unwrap_or_else(|_| error_exit(format!("Invalid value for --min-freq: {}", arg)));
+                
+                if min_frequency < 2 {
+                    error_exit(format!("Invalid value for --min-freq: {}, value must be >= 2", arg));
+                }
+
+                ident = Ident::None;
+            }
+            Ident::LowMemory => {
+                low_memory = str::parse::<bool>(arg.as_str()).unwrap_or_else(|_| error_exit(format!("Invalid value for --low-mem: {} (should be \"true\" or \"false\")", arg)));
+
+                ident = Ident::None;
+            }
+        }
+    }
+
+    let start = Instant::now();
+
+    let filename = filename.unwrap_or_else(|| error_exit(format!("Argument -f is required!")));
+    
+    println!("Tokenizing {filename}");
+
+    let text = read_file(filename);
+    let tokenizer = BPETokenizer::from_text(&text, vocab_size, min_frequency, low_memory);
+    let tokenized = tokenizer.encode(&text);
+
+    println!("Tokenization created in {:?}", start.elapsed());
+    println!();
+    println!("Vocab size: {}", tokenizer.vocab.len());
+    println!("Compression: {} -> {} ({:.2}%)", text.len(), tokenized.len(), 100.0 - tokenized.len() as f32 / text.len() as f32 * 100.0);
+
+    tokenizer.save("tokenization.tokr").unwrap();
 }
