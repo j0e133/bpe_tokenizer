@@ -1,3 +1,5 @@
-/target
-/texts/*
-/*.tokr
+/target/
+
+*.txt
+*.tokr
+*.tokd

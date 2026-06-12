@@ -3,20 +3,22 @@
 
 A byte-pair encoding tokenizer written in Rust.
 
-Can be trained on a corpus of text with parameters for limiting vocabulary size and/or compression level.
+Can be trained on a corpus of text with parameters for limiting vocabulary size and/or compression level and saving to JSON.
 
 Intended to be run as a CLI.
 
 ## Usage
 
-Once compiled, the executable can be run in command line.
+Compile using `cargo build --release` and run the executable in command line.
 
 ```
-./target/release/bpe_tokenizer.exe [-f | --files] text1.txt text2.txt ...
-                                   [-d | --dirs] /dir1 /dir2 ...
-                                   [-v | --vocab-size] 1024
-                                   --min-freq
-                                   --low-mem
+./target/release/bpe_tokenizer [-f | --files] text1.txt text2.txt ...
+                               [-d | --dirs] dir1 dir2 ...
+                               [-v | --vocab-size] 1024
+                               [--min-freq] 32
+                               [--low-mem]
+                               [--tokenizer-path] path.tokr
+                               [--tokenization-path] path.tokd
 ```
 
 ### Arguments
@@ -28,6 +30,8 @@ Once compiled, the executable can be run in command line.
 | -v or --vocab-size | The maximum vocabulary size produced. A value of 0 will stop once --min-freq is fulfilled. | Must be >= the number of unique tokens in the corpus. | 0 |
 | --min-freq | The lowest frequency in the text at which byte pairs will be combined. | Must be >= 2 | 2 |
 | --low-mem | Turns on low memory mode, saving RAM at the cost of speed. Can be undeterministic. | N/A | off |
+| --tokenizer-path | The path to save the tokenizer's JSON representation to. | Must be a valid file path | None |
+| --tokenization-path | The path to save the Corpus' tokenization JSON representation to. | Must be a valid file path | None |
 
 ## Credits
 

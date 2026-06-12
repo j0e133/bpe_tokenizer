@@ -45,6 +45,59 @@ impl Rule {
 }
 
 
+struct Tokenization {
+    tokens: Box<[Token]>
+}
+
+impl Tokenization {
+    fn from_vec(vec: Vec<Token>) -> Self {
+        Self {
+            tokens: vec.into_boxed_slice()
+        }
+    }
+
+    /// Creates a JSON representation of the tokenization in a String
+    fn to_json(&self) -> String {
+        let tokens =
+            self.tokens.iter()
+                       .map(|Token(tok)| tok.to_string())
+                       .join(",");
+
+        format!("[{}]", tokens)
+    }
+}
+
+
+struct CorpusTokenization {
+    tokenizations: Vec<Tokenization>
+}
+
+impl CorpusTokenization {
+    fn new(tokenizations: Vec<Tokenization>) -> Self {
+        Self { tokenizations }
+    }
+
+    /// Creates a JSON representation of the corpus in a String
+    fn to_json(&self) -> String {
+        let tokenizations =
+            self.tokenizations.iter()
+                              .map(|tok| tok.to_json())
+                              .join(",");
+
+        format!("[{}]", tokenizations)
+    }
+
+    /// Saves a JSON representation of the corpus to a file
+    fn save<T: AsRef<Path>>(&self, filename: T) -> std::io::Result<()> {
+        let json = self.to_json();
+
+        write(filename, json)?;
+
+        Ok(())
+    }
+}
+
+
 struct BPETokenizer {
     vocab: Vec<String>,
     rules: Vec<Rule>,
@@ -67,7 +120,7 @@ impl BPETokenizer {
     /// `min_frequency` is the lowest frequency in the text at which pairs will still be combined. Should be >= 2
     /// 
     /// `low_memory` is whether or not to use low memory mode, which is slower
-    fn from_corpus(corpus: &Vec<String>, vocab_size: usize, min_frequency: usize, low_memory: bool) -> (Self, Vec<Box<[Token]>>) {
+    fn from_corpus(corpus: &Vec<String>, vocab_size: usize, min_frequency: usize, low_memory: bool) -> (Self, CorpusTokenization) {
         let mut vocab: Vec<String> =
             corpus.iter()
                   .flat_map(|s| s.chars())
@@ -131,10 +184,11 @@ impl BPETokenizer {
         }
 
         let tokenizer = Self::new(vocab, rules, encoding_table);
-        let encoded_corpus =
+        let encoded_corpus = CorpusTokenization::new(
             encodings.into_iter()
-                     .map(|encoding| encoding.into_boxed_slice())
-                     .collect();
+                                    .map(|encoding| Tokenization::from_vec(encoding))
+                                    .collect()
+        );
 
         (tokenizer, encoded_corpus)
     }
@@ -195,7 +249,7 @@ impl BPETokenizer {
     }
 
     /// Encodes a String into a `Box<[Token]>`.
-    fn encode(&self, text: &String) -> Box<[Token]> {
+    fn encode(&self, text: &String) -> Tokenization {
         let mut encoding: Vec<Token> =
             text.chars()
                 .map(|ch| *self.encoding_table.get(&ch).expect("Character encountered in input string isn't in tokenizer vocab!"))
@@ -205,12 +259,13 @@ impl BPETokenizer {
             rule.apply_ip(&mut encoding);
         }
 
-        encoding.into_boxed_slice()
+        Tokenization::from_vec(encoding)
     }
 
     /// Decodes a `Box<[Token]>` into a String.
-    fn decode(&self, tokenization: Box<[Token]>) -> String {
-        tokenization.iter()
+    fn decode(&self, tokenization: Tokenization) -> String {
+        tokenization.tokens
+                    .iter()
                     .map(|token| &self.vocab[token.0])
                     .join("")
     }
@@ -219,20 +274,20 @@ impl BPETokenizer {
     fn to_json(&self) -> String {
         let encoding_table =
             self.encoding_table.iter()
-                               .map(|(ch, tok)| format!("\"{}\": {}", ch.escape_default().collect::<String>(), tok.0))
-                               .join(", ");
+                               .map(|(ch, tok)| format!("\"{}\":{}", ch.escape_default().collect::<String>(), tok.0))
+                               .join(",");
 
         let vocab =
             self.vocab.iter()
                       .map(|voc| format!("\"{}\"", voc.escape_default().collect::<String>()))
-                      .join(", ");
+                      .join(",");
 
         let rules =
             self.rules.iter()
-                      .map(|rule| format!("[{}, {}, {}]", rule.a.0, rule.b.0, rule.replacement.0))
-                      .join(", ");
+                      .map(|rule| format!("[{},{},{}]", rule.a.0, rule.b.0, rule.replacement.0))
+                      .join(",");
 
-        format!("{{\"vocab\": [{}], \"rules\": [{}], \"encoding_table\": {{{}}}}}", vocab, rules, encoding_table)
+        format!("{{\"vocab\":[{}],\"rules\":[{}],\"encoding_table\":{{{}}}}}", vocab, rules, encoding_table)
     }
 
     /// Saves a JSON representation of the tokenizer to a file
@@ -252,7 +307,9 @@ enum Argument {
     Dirs,
     VocabSize,
     MinFrequency,
-    LowMemory
+    LowMemory,
+    TokenizerPath,
+    TokenizationPath,
 }
 
 impl Argument {
@@ -263,7 +320,9 @@ impl Argument {
             "-v" | "--vocab-size" => Argument::VocabSize,
             "--min-freq"          => Argument::MinFrequency,
             "--low-mem"           => Argument::LowMemory,
-            other           => error_exit(format!("Invalid argument: {}", other))
+            "--tokenizer-path"    => Argument::TokenizerPath,
+            "--tokenization-path" => Argument::TokenizationPath,
+            other               => error_exit(format!("Invalid argument: {}", other))
         }
     }
 }
@@ -306,6 +365,8 @@ fn main() {
     let mut vocab_size = 0;
     let mut min_frequency = 2;
     let mut low_memory = false;
+    let mut tokenizer_path = None;
+    let mut tokenization_path = None;
 
     for arg in args {
         match argument {
@@ -361,6 +422,16 @@ fn main() {
                 // should be unreachable
                 panic!("ERROR: Invalid state reached. --low-mem flag didn't reset argument");
             }
+            Argument::TokenizerPath => {
+                tokenizer_path = Some(arg);
+
+                argument = Argument::None;
+            }
+            Argument::TokenizationPath => {
+                tokenization_path = Some(arg);
+
+                argument = Argument::None;
+            }
         }
     }
 
@@ -374,15 +445,22 @@ fn main() {
     println!("Loaded corpus ({} files) in {:?}", filenames.len(), start.elapsed());
 
     let start = Instant::now();
-    let (tokenizer, tokenized) = BPETokenizer::from_corpus(&corpus, vocab_size, min_frequency, low_memory);
-    let compressed_size: usize = tokenized.iter().map(|text| text.len()).sum();
+    let (tokenizer, tokenization) = BPETokenizer::from_corpus(&corpus, vocab_size, min_frequency, low_memory);
+    let tokenization_size: usize = tokenization.tokenizations.iter().map(|tokz| tokz.tokens.len()).sum();
     println!("Trained tokenizer on {} tokens in {:?}", format_commas(size), start.elapsed());
+
+    let start = Instant::now();
+    if let Some(path) = tokenizer_path {
+        tokenizer.save(path).unwrap();
+    }
+    if let Some(path) = tokenization_path {
+        tokenization.save(path).unwrap();
+    }
+    println!("Saved in {:?}", start.elapsed());
 
     println!("Finished in {:?}", total.elapsed());
     println!();
     println!("Number of chars: {}", tokenizer.encoding_table.len());
     println!("Vocab size: {}", tokenizer.vocab.len());
-    println!("Compression: {} -> {} ({:.2}%)", format_commas(size), format_commas(compressed_size), 100.0 - (compressed_size as f32) / (size as f32) * 100.0);
-
-    tokenizer.save("tokenization.tokr").unwrap();
+    println!("Compression: {} -> {} ({:.2}%)", format_commas(size), format_commas(tokenization_size), 100.0 - (tokenization_size as f32) / (size as f32) * 100.0);
 }
