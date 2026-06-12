@@ -374,60 +374,52 @@ fn main() {
     let mut character = false;
 
     for arg in args {
+        if arg.starts_with('-') {
+            argument = match Argument::from_string(arg) {
+                // check flag arguments
+                Argument::LowMemory => {
+                    low_memory = true;
+                    Argument::None
+                }
+                Argument::Character => {
+                    character = true;
+                    Argument::None
+                }
+                other => other
+            };
+
+            continue;
+        }
+
         match argument {
             Argument::None => {
-                argument = Argument::from_string(arg);
-                
-                // check flag arguments
-                match argument {
-                    Argument::LowMemory => {
-                        low_memory = true;
-                        argument = Argument::None;
-                    }
-                    Argument::Character => {
-                        character = true;
-                        argument = Argument::None;
-                    }
-                    _ => {}
-                }
+                error_exit(format!("One of -f and -d is required!"))
             }
             Argument::Files => {
-                if arg.starts_with('-') {
-                    argument = Argument::from_string(arg);
+                filenames.push(arg);
 
-                } else {
-                    filenames.push(arg);
-                }
+                continue;
             }
             Argument::Dirs => {
-                if arg.starts_with('-') {
-                    argument = Argument::from_string(arg);
+                for entry in fs::read_dir(&arg).unwrap_or_else(|_| error_exit(format!("Failure reading directory: {}", arg))) {
+                    let entry = entry.unwrap_or_else(|_| error_exit(format!("Failure reading directory: {}", arg)));
+                    let path = entry.path();
 
-                } else {
-                    for entry in fs::read_dir(&arg).unwrap_or_else(|_| error_exit(format!("Failure reading directory: {}", arg))) {
-                        let entry = entry.unwrap_or_else(|_| error_exit(format!("Failure reading directory: {}", arg)));
-                        let path = entry.path();
-
-                        if path.is_file() {
-                            filenames.push(path.to_string_lossy().to_string());
-                        }
+                    if path.is_file() {
+                        filenames.push(path.to_string_lossy().to_string());
                     }
                 }
+
+                continue;
             }
             Argument::VocabSize => {
                 vocab_size = str::parse::<usize>(arg.as_str()).unwrap_or_else(|_| error_exit(format!("Invalid value for --vocab-size: {}", arg)));
-
-                argument = Argument::None;
             }
             Argument::TokenizerPath => {
                 tokenizer_path = Some(arg);
-
-                argument = Argument::None;
             }
             Argument::TokenizationPath => {
                 tokenization_path = Some(arg);
-
-                argument = Argument::None;
             }
             Argument::MinFrequency => {
                 min_frequency = str::parse::<usize>(arg.as_str()).unwrap_or_else(|_| error_exit(format!("Invalid value for --min-freq: {}", arg)));
@@ -435,8 +427,6 @@ fn main() {
                 if min_frequency < 2 {
                     error_exit(format!("Invalid value for --min-freq: {}, value must be >= 2", arg));
                 }
-
-                argument = Argument::None;
             }
             Argument::LowMemory => {
                 // should be unreachable
@@ -447,6 +437,8 @@ fn main() {
                 panic!("ERROR: Invalid state reached. --character flag didn't reset argument");
             }
         }
+
+        argument = Argument::None;
     }
 
     let total = Instant::now();
