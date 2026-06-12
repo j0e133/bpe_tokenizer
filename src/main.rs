@@ -1,9 +1,9 @@
-#![feature(iter_intersperse)]
 
-use std::{collections::HashMap, fs::{read_to_string, write}, path::Path, time::Instant};
+use std::{collections::HashMap, fs::{self, read_to_string, write}, path::Path, sync::{atomic::{AtomicUsize, Ordering}}, time::Instant};
 
+use rustc_hash::{FxBuildHasher, FxHashMap};
 use itertools::Itertools;
-use rayon::iter::{IntoParallelRefMutIterator, ParallelIterator};
+use rayon::prelude::*;
 
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -21,22 +21,26 @@ impl Rule {
         Self { a, b, replacement }
     }
 
-    fn apply_into(&self, tokens: &Vec<Token>, out: &mut Vec<Token>) {
+    fn apply_ip(&self, tokens: &mut Vec<Token>) {
         let mut i = 0;
+        let mut j = 0;
 
         while i < tokens.len() {
             // combine two tokens
             if i < tokens.len() - 1 && self.a == tokens[i] && self.b == tokens[i + 1] {
-                out.push(self.replacement);
+                tokens[j] = self.replacement;
                 i += 2;
             }
-            
             // keep token
             else {
-                out.push(tokens[i]);
+                tokens[j] = tokens[i];
                 i += 1;
             }
+
+            j += 1;
         }
+
+        tokens.truncate(j);
     }
 }
 
@@ -44,11 +48,11 @@ impl Rule {
 struct BPETokenizer {
     vocab: Vec<String>,
     rules: Vec<Rule>,
-    encoding_table: HashMap<char, Token>
+    encoding_table: FxHashMap<char, Token>
 }
 
 impl BPETokenizer {
-    fn new(vocab: Vec<String>, rules: Vec<Rule>, encoding_table: HashMap<char, Token>) -> Self {
+    fn new(vocab: Vec<String>, rules: Vec<Rule>, encoding_table: FxHashMap<char, Token>) -> Self {
         Self {
             vocab,
             rules,
@@ -56,12 +60,14 @@ impl BPETokenizer {
         }
     }
 
-    /// Creates a tokenizer from a String.
+    /// Creates a tokenizer from a corpus of Strings. Returns the tokenizer and the encoded corpus
     /// 
     /// `vocab_size` is the maximum number of vocab chunks the tokenizer will create, unlimited if 0.
     /// 
     /// `min_frequency` is the lowest frequency in the text at which pairs will still be combined. Should be >= 2
-    fn from_corpus(corpus: &Vec<String>, vocab_size: usize, min_frequency: usize, low_memory: bool) -> Self {
+    /// 
+    /// `low_memory` is whether or not to use low memory mode, which is slower
+    fn from_corpus(corpus: &Vec<String>, vocab_size: usize, min_frequency: usize, low_memory: bool) -> (Self, Vec<Box<[Token]>>) {
         let mut vocab: Vec<String> =
             corpus.iter()
                   .flat_map(|s| s.chars())
@@ -70,7 +76,7 @@ impl BPETokenizer {
                   .map(|ch| ch.to_string())
                   .collect();
 
-        let encoding_table: HashMap<char, Token> = 
+        let encoding_table: FxHashMap<char, Token> = 
             vocab.iter()
                  .enumerate()
                  .map(|(i, ch)| (ch.chars().next().unwrap(), Token(i)))
@@ -81,21 +87,31 @@ impl BPETokenizer {
         let mut rules = Vec::with_capacity(vocab_size);
         let mut token = vocab.len();
 
-        let mut encodings: Vec<(Vec<Token>, Vec<Token>)> =
+        let mut encodings: Vec<Vec<Token>> =
             corpus.iter()
                   .map(|text|
-                      (text.chars()
-                           .map(|ch| *encoding_table.get(&ch).unwrap())
-                           .collect(),
-                       Vec::with_capacity(text.len())
-                      ))
+                      text.chars()
+                          .map(|ch| *encoding_table.get(&ch).unwrap())
+                          .collect()
+                      )
                   .collect();
+        
+        let counts_len =
+            if low_memory { 0 }                           // don't initialize
+            else if vocab_size == 0 { token * token * 4 } // initialize to double length of vocab 
+            else { vocab_size * vocab_size };             // initialize normally
+
+        let mut counts: Vec<usize> = (0..counts_len).map(|_| Default::default()).collect();
 
         while vocab_size == 0 || token < vocab_size {
-            let ((a, b), n) = if low_memory {
+            if !low_memory && token * token > counts.len() {
+                counts = (0..counts.len() * 4).map(|_| Default::default()).collect(); // double allocation length
+            }
+
+            let ([a, b], n) = if low_memory {
                 Self::most_common_pair_low_memory(&encodings)
             } else {
-                Self::most_common_pair(&encodings, token)
+                Self::most_common_pair(&encodings, token, &mut counts)
             };
 
             // stop combining if frequency of pair < min_frequency
@@ -103,70 +119,90 @@ impl BPETokenizer {
 
             let rule = Rule::new(a, b, Token(token));
 
-            encodings.par_iter_mut().for_each(|(encoding, buffer)| {
-                rule.apply_into(encoding, buffer);
-
-                // switch buffer to encoding and clear the new buffer
-                std::mem::swap(encoding, buffer);
-                buffer.clear();
+            encodings.par_iter_mut().for_each(|encoding| {
+                rule.apply_ip(encoding);
             });
 
             let combined_str = format!("{}{}", vocab[a.0], vocab[b.0]);
 
             vocab.push(combined_str);
             rules.push(rule);
-            token += 1;
+            token = vocab.len();
         }
 
-        Self::new(vocab, rules, encoding_table)
+        let tokenizer = Self::new(vocab, rules, encoding_table);
+        let encoded_corpus =
+            encodings.into_iter()
+                     .map(|encoding| encoding.into_boxed_slice())
+                     .collect();
+
+        (tokenizer, encoded_corpus)
     }
 
     /// Returns the most common common pair of consecutive tokens and how many times it appears.
-    fn most_common_pair(encodings: &Vec<(Vec<Token>, Vec<Token>)>, n: usize) -> ((Token, Token), usize) {
-        let mut counts = vec![0; n * n];
+    fn most_common_pair(encodings: &Vec<Vec<Token>>, n: usize, counts: &mut Vec<usize>) -> ([Token; 2], usize) {
+        // fill preallocated vec
+        counts[0..n * n].fill(0);
 
-        for (encoding, _) in encodings {
-            for i in 0..encoding.len() - 1 {
-                counts[encoding[i].0 + encoding[i + 1].0 * n] += 1
-            }
-        }
+        encodings.into_iter()
+                 .flat_map(|encoding| encoding.array_windows::<2>())
+                 .for_each(|&[a, b]| {
+                    counts[a.0 + b.0 * n] += 1;
+                 });
 
-        let most_common_i = counts.iter().position_max().unwrap();
+        let (i, &count) =
+            counts.par_iter()
+                  .enumerate()
+                  .max_by_key(|&(_, count)| count)
+                  .unwrap();
 
-        ((Token(most_common_i % n), Token(most_common_i / n)), counts[most_common_i])
+        ([Token(i % n), Token(i / n)], count)
     }
 
     /// A slower but more memory efficient `most_common_pair` function.
-    fn most_common_pair_low_memory(encodings: &Vec<(Vec<Token>, Vec<Token>)>) -> ((Token, Token), usize) {
-        let mut counts = HashMap::new();
+    fn most_common_pair_low_memory(encodings: &Vec<Vec<Token>>) -> ([Token; 2], usize) {
+        let mut counts = HashMap::with_hasher(FxBuildHasher);
 
-        for (encoding, _) in encodings {
-            for i in 0..encoding.len() - 1 {
-                counts.entry((encoding[i], encoding[i + 1]))
-                    .and_modify(|i| *i += 1)
-                    .or_insert(1usize);
-            }
-        }
+        encodings.into_iter()
+                 .flat_map(|encoding| encoding.array_windows::<2>())
+                 .for_each(|&pair| {
+                     *counts.entry(pair).or_insert(0) += 1;
+                 });
 
-        let most_common = counts.into_iter().max_by_key(|&(_, i)| i).unwrap();
+        let out =
+            counts.into_par_iter()
+                  .max_by_key(|&(_, i)| i)
+                  .unwrap();
 
-        most_common
+        out
+    }
+
+    /// Slower than single threaded on a Ryzen 5 9600X with all 12 threads, even for large corpuses
+    fn _most_common_pair_multithread(encodings: &Vec<Vec<Token>>, n: usize, counts: &mut Vec<AtomicUsize>) -> ([Token; 2], usize) {
+        encodings.into_par_iter()
+                 .flat_map(|encoding| encoding.par_array_windows::<2>())
+                 .for_each(|&[Token(a), Token(b)]| {
+                     counts[a + b * n].fetch_add(1, Ordering::Relaxed);
+                 });
+
+        let (i, count) =
+            (0..n * n).into_par_iter()
+                      .map(|i| (i, counts[i].swap(0, Ordering::Relaxed))) // also resets value to 0
+                      .max_by_key(|&(_, count)| count)
+                      .unwrap();
+
+        ([Token(i % n), Token(i / n)], count)
     }
 
     /// Encodes a String into a `Box<[Token]>`.
     fn encode(&self, text: &String) -> Box<[Token]> {
-        let mut buffer: Vec<Token> = Vec::with_capacity(text.len());
         let mut encoding: Vec<Token> =
             text.chars()
                 .map(|ch| *self.encoding_table.get(&ch).expect("Character encountered in input string isn't in tokenizer vocab!"))
                 .collect();
 
         for rule in &self.rules {
-            rule.apply_into(&encoding, &mut buffer);
-
-            // switch buffer to encoding and clear the new buffer
-            std::mem::swap(&mut encoding, &mut buffer);
-            buffer.clear();
+            rule.apply_ip(&mut encoding);
         }
 
         encoding.into_boxed_slice()
@@ -212,7 +248,8 @@ impl BPETokenizer {
 
 enum Argument {
     None,
-    File,
+    Files,
+    Dirs,
     VocabSize,
     MinFrequency,
     LowMemory
@@ -221,7 +258,8 @@ enum Argument {
 impl Argument {
     fn from_string(string: String) -> Self {
         match string.as_str() {
-            "-f" | "--files"      => Argument::File,
+            "-f" | "--files"      => Argument::Files,
+            "-d" | "--dirs"       => Argument::Dirs,
             "-v" | "--vocab-size" => Argument::VocabSize,
             "--min-freq"          => Argument::MinFrequency,
             "--low-mem"           => Argument::LowMemory,
@@ -245,14 +283,13 @@ fn error_exit(message: String) -> ! {
 
 
 fn format_commas(number: usize) -> String {
-    Iterator::intersperse(number.to_string()
+    number.to_string()
           .chars()
           .rev()
           .chunks(3)
           .into_iter()
-          .map(|chunk| chunk.collect::<String>()),
-          String::from(","))
-          .collect::<String>()
+          .map(|chunk| chunk.collect::<String>())
+          .join(",")
           .chars()
           .rev()
           .collect()
@@ -273,14 +310,37 @@ fn main() {
     for arg in args {
         match argument {
             Argument::None => {
-                argument = Argument::from_string(arg)
+                argument = Argument::from_string(arg);
+
+                match argument {
+                    Argument::LowMemory => {
+                        low_memory = true;
+                        argument = Argument::None;
+                    },
+                    _ => {}
+                }
             }
-            Argument::File => {
+            Argument::Files => {
                 if arg.starts_with('-') {
-                    argument = Argument::from_string(arg)
+                    argument = Argument::from_string(arg);
 
                 } else {
                     filenames.push(arg);
+                }
+            }
+            Argument::Dirs => {
+                if arg.starts_with('-') {
+                    argument = Argument::from_string(arg);
+
+                } else {
+                    for entry in fs::read_dir(&arg).unwrap_or_else(|_| error_exit(format!("Failure reading directory: {}", arg))) {
+                        let entry = entry.unwrap_or_else(|_| error_exit(format!("Failure reading directory: {}", arg)));
+                        let path = entry.path();
+
+                        if path.is_file() {
+                            filenames.push(path.to_string_lossy().to_string());
+                        }
+                    }
                 }
             }
             Argument::VocabSize => {
@@ -298,30 +358,27 @@ fn main() {
                 argument = Argument::None;
             }
             Argument::LowMemory => {
-                low_memory = str::parse::<bool>(arg.as_str()).unwrap_or_else(|_| error_exit(format!("Invalid value for --low-mem: {} (should be \"true\" or \"false\")", arg)));
-
-                argument = Argument::None;
+                // should be unreachable
+                panic!("ERROR: Invalid state reached. --low-mem flag didn't reset argument");
             }
         }
     }
 
+    let total = Instant::now();
+
+    if filenames.is_empty() { error_exit(format!("One of -f and -d is required!")) }
+
     let start = Instant::now();
+    let corpus: Vec<String> = filenames.iter().map(read_file).collect();
+    let size = corpus.iter().map(|text| text.len()).sum();
+    println!("Loaded corpus ({} files) in {:?}", filenames.len(), start.elapsed());
 
-    if filenames.is_empty() { error_exit(format!("Argument -f is required!")) }
-    
-    println!("Tokenizing: {}", filenames.iter().join(", "));
-
-    let corpus = filenames.iter().map(read_file).collect();
-    let tokenizer = BPETokenizer::from_corpus(&corpus, vocab_size, min_frequency, low_memory);
-    let tokenized: Vec<Box<[Token]>> =
-        corpus.iter()
-              .map(|text| tokenizer.encode(text))
-              .collect();
-    
-    let size: usize = corpus.iter().map(|text| text.len()).sum();
+    let start = Instant::now();
+    let (tokenizer, tokenized) = BPETokenizer::from_corpus(&corpus, vocab_size, min_frequency, low_memory);
     let compressed_size: usize = tokenized.iter().map(|text| text.len()).sum();
+    println!("Trained tokenizer on {} tokens in {:?}", format_commas(size), start.elapsed());
 
-    println!("Finished in {:?}", start.elapsed());
+    println!("Finished in {:?}", total.elapsed());
     println!();
     println!("Number of chars: {}", tokenizer.encoding_table.len());
     println!("Vocab size: {}", tokenizer.vocab.len());

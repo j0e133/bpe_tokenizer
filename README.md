@@ -13,6 +13,7 @@ Once compiled, the executable can be run in command line.
 
 ```
 ./target/release/bpe_tokenizer.exe [-f | --files] text1.txt text2.txt ...
+                                   [-d | --dirs] /dir1 /dir2 ...
                                    [-v | --vocab-size] 1024
                                    --min-freq
                                    --low-mem
@@ -22,10 +23,11 @@ Once compiled, the executable can be run in command line.
 
 | Argument | Meaning | Constraints | Default |
 | --- | --- | --- | :---: |
-| -f or --files | The corpus of files to be included. | Must have at least one file. | N/A |
+| -f or --files | The files to be included. | Must have at least one file or dir. | N/A |
+| -d or --dirs | The directories to search for files to include. | Must have at least one file or dir. | N/A |
 | -v or --vocab-size | The maximum vocabulary size produced. A value of 0 will stop once --min-freq is fulfilled. | Must be >= the number of unique tokens in the corpus. | 0 |
 | --min-freq | The lowest frequency in the text at which byte pairs will be combined. | Must be >= 2 | 2 |
-| --low-mem | Whether or not to use low memory mode, saving RAM at the cost of speed. | Must be "true" or "false" | false |
+| --low-mem | Turns on low memory mode, saving RAM at the cost of speed. Can be undeterministic. | N/A | off |
 
 ## Credits
 
