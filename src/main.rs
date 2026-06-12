@@ -1,5 +1,5 @@
 
-use std::{collections::HashMap, fs::{self, read_to_string, write}, path::Path, sync::{atomic::{AtomicUsize, Ordering}}, time::Instant};
+use std::{collections::HashMap, fs::{self, read_to_string, write}, path::Path, sync::atomic::{AtomicUsize, Ordering}, time::Instant};
 
 use rustc_hash::{FxBuildHasher, FxHashMap};
 use itertools::Itertools;
@@ -113,14 +113,16 @@ impl BPETokenizer {
         }
     }
 
-    /// Creates a tokenizer from a corpus of Strings. Returns the tokenizer and the encoded corpus
+    /// Creates a tokenizer from a corpus of Strings. Returns the tokenizer and the encoded corpus.
     /// 
     /// `vocab_size` is the maximum number of vocab chunks the tokenizer will create, unlimited if 0.
     /// 
-    /// `min_frequency` is the lowest frequency in the text at which pairs will still be combined. Should be >= 2
+    /// `min_frequency` is the lowest frequency in the text at which pairs will still be combined. Should be >= 2.
     /// 
-    /// `low_memory` is whether or not to use low memory mode, which is slower
-    fn from_corpus(corpus: &Vec<String>, vocab_size: usize, min_frequency: usize, low_memory: bool) -> (Self, CorpusTokenization) {
+    /// `low_memory` is whether or not to use low memory mode, which is slower.
+    /// 
+    /// `character` when true will skip the generation of rules, keeping the tokenizer as a raw character tokenizer.
+    fn from_corpus(corpus: &Vec<String>, vocab_size: usize, min_frequency: usize, low_memory: bool, character: bool) -> (Self, CorpusTokenization) {
         let mut vocab: Vec<String> =
             corpus.iter()
                   .flat_map(|s| s.chars())
@@ -148,7 +150,7 @@ impl BPETokenizer {
                           .collect()
                       )
                   .collect();
-        
+
         let counts_len =
             if low_memory { 0 }                           // don't initialize
             else if vocab_size == 0 { token * token * 4 } // initialize to double length of vocab 
@@ -156,7 +158,7 @@ impl BPETokenizer {
 
         let mut counts: Vec<usize> = (0..counts_len).map(|_| Default::default()).collect();
 
-        while vocab_size == 0 || token < vocab_size {
+        while !character && (vocab_size == 0 || token < vocab_size) {
             if !low_memory && token * token > counts.len() {
                 counts = (0..counts.len() * 4).map(|_| Default::default()).collect(); // double allocation length
             }
@@ -249,7 +251,7 @@ impl BPETokenizer {
     }
 
     /// Encodes a String into a `Box<[Token]>`.
-    fn encode(&self, text: &String) -> Tokenization {
+    fn _encode(&self, text: &String) -> Tokenization {
         let mut encoding: Vec<Token> =
             text.chars()
                 .map(|ch| *self.encoding_table.get(&ch).expect("Character encountered in input string isn't in tokenizer vocab!"))
@@ -263,7 +265,7 @@ impl BPETokenizer {
     }
 
     /// Decodes a `Box<[Token]>` into a String.
-    fn decode(&self, tokenization: Tokenization) -> String {
+    fn _decode(&self, tokenization: Tokenization) -> String {
         tokenization.tokens
                     .iter()
                     .map(|token| &self.vocab[token.0])
@@ -306,10 +308,11 @@ enum Argument {
     Files,
     Dirs,
     VocabSize,
-    MinFrequency,
-    LowMemory,
     TokenizerPath,
     TokenizationPath,
+    Character,
+    MinFrequency,
+    LowMemory
 }
 
 impl Argument {
@@ -318,10 +321,11 @@ impl Argument {
             "-f" | "--files"      => Argument::Files,
             "-d" | "--dirs"       => Argument::Dirs,
             "-v" | "--vocab-size" => Argument::VocabSize,
-            "--min-freq"          => Argument::MinFrequency,
-            "--low-mem"           => Argument::LowMemory,
             "--tokenizer-path"    => Argument::TokenizerPath,
             "--tokenization-path" => Argument::TokenizationPath,
+            "--character"         => Argument::Character,
+            "--min-freq"          => Argument::MinFrequency,
+            "--low-mem"           => Argument::LowMemory,
             other               => error_exit(format!("Invalid argument: {}", other))
         }
     }
@@ -363,21 +367,27 @@ fn main() {
     let mut argument = Argument::None;
     let mut filenames = Vec::new();
     let mut vocab_size = 0;
-    let mut min_frequency = 2;
-    let mut low_memory = false;
     let mut tokenizer_path = None;
     let mut tokenization_path = None;
+    let mut min_frequency = 2;
+    let mut low_memory = false;
+    let mut character = false;
 
     for arg in args {
         match argument {
             Argument::None => {
                 argument = Argument::from_string(arg);
-
+                
+                // check flag arguments
                 match argument {
                     Argument::LowMemory => {
                         low_memory = true;
                         argument = Argument::None;
-                    },
+                    }
+                    Argument::Character => {
+                        character = true;
+                        argument = Argument::None;
+                    }
                     _ => {}
                 }
             }
@@ -409,6 +419,16 @@ fn main() {
 
                 argument = Argument::None;
             }
+            Argument::TokenizerPath => {
+                tokenizer_path = Some(arg);
+
+                argument = Argument::None;
+            }
+            Argument::TokenizationPath => {
+                tokenization_path = Some(arg);
+
+                argument = Argument::None;
+            }
             Argument::MinFrequency => {
                 min_frequency = str::parse::<usize>(arg.as_str()).unwrap_or_else(|_| error_exit(format!("Invalid value for --min-freq: {}", arg)));
                 
@@ -422,15 +442,9 @@ fn main() {
                 // should be unreachable
                 panic!("ERROR: Invalid state reached. --low-mem flag didn't reset argument");
             }
-            Argument::TokenizerPath => {
-                tokenizer_path = Some(arg);
-
-                argument = Argument::None;
-            }
-            Argument::TokenizationPath => {
-                tokenization_path = Some(arg);
-
-                argument = Argument::None;
+            Argument::Character => {
+                // should be unreachable
+                panic!("ERROR: Invalid state reached. --character flag didn't reset argument");
             }
         }
     }
@@ -445,7 +459,7 @@ fn main() {
     println!("Loaded corpus ({} files) in {:?}", filenames.len(), start.elapsed());
 
     let start = Instant::now();
-    let (tokenizer, tokenization) = BPETokenizer::from_corpus(&corpus, vocab_size, min_frequency, low_memory);
+    let (tokenizer, tokenization) = BPETokenizer::from_corpus(&corpus, vocab_size, min_frequency, low_memory, character);
     let tokenization_size: usize = tokenization.tokenizations.iter().map(|tokz| tokz.tokens.len()).sum();
     println!("Trained tokenizer on {} tokens in {:?}", format_commas(size), start.elapsed());
 
