@@ -276,12 +276,12 @@ impl BPETokenizer {
     fn to_json(&self) -> String {
         let encoding_table =
             self.encoding_table.iter()
-                               .map(|(ch, tok)| format!("\"{}\":{}", ch.escape_default().collect::<String>(), tok.0))
+                               .map(|(ch, Token(tok))| format!("\"{}\":{}", ch.escape_default().collect::<String>().replace(r"\'", "'"), tok))
                                .join(",");
 
         let vocab =
             self.vocab.iter()
-                      .map(|voc| format!("\"{}\"", voc.escape_default().collect::<String>()))
+                      .map(|voc| format!("\"{}\"", voc.escape_default().collect::<String>().replace(r"\'", "'")))
                       .join(",");
 
         let rules =
